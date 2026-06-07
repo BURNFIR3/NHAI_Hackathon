@@ -1,0 +1,32 @@
+name: flutter_face_kit
+description: "A fully unique, robust, completely OFFLINE facial authentication prototype application."
+version: 1.0.0
+publish_to: 'none'
+
+environment:
+  sdk: ^3.6.2
+  flutter: '>=3.3.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  onnxruntime_v2: ^1.23.2+2
+  flutter_secure_storage: ^9.2.2
+  camera: ^0.11.0
+  image: ^4.5.2
+  path_provider: ^2.1.5
+  path: ^1.9.0
+  fluttertoast: ^8.2.8
+  permission_handler: ^11.3.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/models/face_detection_yunet_2023mar.onnx
+    - assets/models/edgeface_xs_gamma_06.onnx
+    - assets/models/best_model.onnx

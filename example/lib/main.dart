@@ -65,7 +65,6 @@ class _HomeScreenState extends State<HomeScreen> {
       setState(() => _engineReady = true);
     } catch (e) {
       debugPrint('Engine init error: $e');
-      Fluttertoast.showToast(msg: "Error initializing engine. Check models folder.");
     }
   }
 
@@ -99,15 +98,20 @@ class _HomeScreenState extends State<HomeScreen> {
                 'OFFLINE FACIAL AUTHENTICATION',
                 style: TextStyle(fontSize: 12, color: Colors.cyan),
               ),
-              const SizedBox(height: 60),
+              const SizedBox(height: 20),
+              FutureBuilder<Map<String, String>>(
+                future: storage.readAll(),
+                builder: (context, snapshot) {
+                  final count = snapshot.data?.length ?? 0;
+                  return Text(
+                    'DATABASE: $count PROFILES ENROLLED',
+                    style: TextStyle(fontSize: 10, color: count > 0 ? Colors.greenAccent : Colors.white24, letterSpacing: 2),
+                  );
+                },
+              ),
+              const SizedBox(height: 40),
               if (!_engineReady)
-                Column(
-                  children: [
-                    const CircularProgressIndicator(color: Colors.cyanAccent),
-                    const SizedBox(height: 10),
-                    const Text('Loading AI Models...', style: TextStyle(color: Colors.white70)),
-                  ],
-                )
+                const CircularProgressIndicator(color: Colors.cyanAccent)
               else ...[
                 _buildMenuButton(
                   context,
@@ -122,10 +126,44 @@ class _HomeScreenState extends State<HomeScreen> {
                   Icons.face_unlock_outlined,
                   () => _startFlow(context, FlowType.verification),
                 ),
+                const SizedBox(height: 40),
+                TextButton.icon(
+                  icon: const Icon(Icons.delete_sweep, color: Colors.redAccent, size: 18),
+                  label: const Text('RESET SYSTEM DATA', style: TextStyle(color: Colors.redAccent, fontSize: 10, letterSpacing: 1.5)),
+                  onPressed: () => _confirmReset(context),
+                ),
               ],
             ],
           ),
         ),
+      ),
+    );
+  }
+
+  void _confirmReset(BuildContext context) {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: Colors.blueGrey.shade900,
+        title: const Text('Reset All Data?', style: TextStyle(color: Colors.white)),
+        content: const Text('This will permanently delete all registered facial profiles from this device.', style: TextStyle(color: Colors.white70)),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('CANCEL'),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent),
+            onPressed: () async {
+              await storage.deleteAll();
+              if (context.mounted) {
+                Navigator.pop(context);
+                Fluttertoast.showToast(msg: "All facial data deleted.");
+              }
+            },
+            child: const Text('DELETE EVERYTHING', style: TextStyle(color: Colors.white)),
+          ),
+        ],
       ),
     );
   }
@@ -191,10 +229,6 @@ class _CameraFlowScreenState extends State<CameraFlowScreen> {
   final TextEditingController _idController = TextEditingController();
   bool _idEntered = false;
 
-  int _livenessStep = 0;
-  bool _blinkDetected = false;
-  bool _headTurnDetected = false;
-
   @override
   void initState() {
     super.initState();
@@ -213,8 +247,8 @@ class _CameraFlowScreenState extends State<CameraFlowScreen> {
       (c) => c.lensDirection == CameraLensDirection.front,
       orElse: () => widget.cameras.first,
     );
-    // Lower resolution to reduce lag
-    _controller = CameraController(front, ResolutionPreset.low, enableAudio: false);
+    // Use Medium for better compatibility with ImageAnalysis on some phones
+    _controller = CameraController(front, ResolutionPreset.medium, enableAudio: false);
     await _controller!.initialize();
     if (!mounted) return;
     setState(() {});
@@ -222,29 +256,11 @@ class _CameraFlowScreenState extends State<CameraFlowScreen> {
     _controller!.startImageStream((image) => _processFrame(image));
   }
 
-  int _debugSaveCount = 0;
-  final int _maxDebugSaves = 5;
-
-  Future<void> _saveDebugFrame(img.Image image) async {
-    if (_debugSaveCount >= _maxDebugSaves) return;
-    try {
-      final directory = await getExternalStorageDirectory();
-      if (directory == null) return;
-      final path = p.join(directory.path, 'debug_frame_${_debugSaveCount++}.jpg');
-      final bytes = img.encodeJpg(image);
-      await File(path).writeAsBytes(bytes);
-      debugPrint('Debug frame saved to: $path');
-    } catch (e) {
-      debugPrint('Error saving debug frame: $e');
-    }
-  }
-
   Future<void> _processFrame(CameraImage image) async {
     if (_isProcessing || !_idEntered) return;
 
     final now = DateTime.now();
-    if (_lastProcessTime != null &&
-        now.difference(_lastProcessTime!).inMilliseconds < 500) {
+    if (_lastProcessTime != null && now.difference(_lastProcessTime!).inMilliseconds < 400) {
       return;
     }
 
@@ -252,24 +268,32 @@ class _CameraFlowScreenState extends State<CameraFlowScreen> {
     _lastProcessTime = now;
 
     try {
-      // Detection now takes the raw CameraImage for optimized preprocessing
       final detection = await widget.engine.detectFace(image);
 
       if (detection == null) {
         if (mounted) setState(() => _status = 'No face detected');
+        _isProcessing = false;
         return;
       }
 
-      // Face found, now convert image for cropping and further stages
-      final img.Image converted = _convertCameraImage(image);
+      if (mounted) setState(() => _status = 'Processing Face...');
 
+      final img.Image converted = _convertCameraImage(image);
       final bbox = detection['bbox'] as List<double>;
+
+      int px = bbox[0].toInt();
+      int py = bbox[1].toInt();
+      int pw = bbox[2].toInt();
+      int ph = bbox[3].toInt();
+      int padW = (pw * 0.15).toInt();
+      int padH = (ph * 0.15).toInt();
+
       final faceCrop = img.copyCrop(
         converted,
-        x: bbox[0].toInt(),
-        y: bbox[1].toInt(),
-        width: bbox[2].toInt(),
-        height: bbox[3].toInt(),
+        x: (px - padW).clamp(0, converted.width),
+        y: (py - padH).clamp(0, converted.height),
+        width: (pw + 2 * padW).clamp(1, converted.width - px),
+        height: (ph + 2 * padH).clamp(1, converted.height - py),
       );
 
       if (widget.type == FlowType.registration) {
@@ -286,6 +310,16 @@ class _CameraFlowScreenState extends State<CameraFlowScreen> {
 
   Future<void> _handleRegistration(img.Image faceCrop) async {
     if (mounted) setState(() => _status = 'Capturing structural descriptor...');
+
+    try {
+      final directory = await getExternalStorageDirectory();
+      if (directory != null) {
+        final path = p.join(directory.path, 'registered_face_${_idController.text}.jpg');
+        await File(path).writeAsBytes(img.encodeJpg(faceCrop));
+        debugPrint('Registered face image saved to: $path');
+      }
+    } catch (e) {}
+
     final embedding = await widget.engine.getEmbedding(faceCrop);
 
     if (embedding != null) {
@@ -298,70 +332,66 @@ class _CameraFlowScreenState extends State<CameraFlowScreen> {
   }
 
   Future<void> _handleVerification(img.Image faceCrop) async {
-    final livenessConf = await widget.engine.checkLiveness(faceCrop);
+    final livenessScore = await widget.engine.checkLiveness(faceCrop);
 
-    if (livenessConf < 0.7) {
-      if (mounted) setState(() => _status = 'Liveness Check Failed (Spoof Detected)');
+    if (livenessScore < 0.6) {
+      if (mounted) setState(() => _status = 'Liveness Check Failed');
       return;
     }
 
-    if (_livenessStep == 0) {
-      if (mounted) {
-        setState(() {
-          _status = 'Human Verification Required';
-          _instruction = 'Please blink your eyes now';
-        });
-      }
-      await Future.delayed(const Duration(seconds: 2));
-      _blinkDetected = true;
-      _livenessStep = 1;
-    } else if (_livenessStep == 1) {
-      if (mounted) setState(() => _instruction = 'Slowly turn your head slightly');
-      await Future.delayed(const Duration(seconds: 2));
-      _headTurnDetected = true;
-      _livenessStep = 2;
+    if (mounted) setState(() => _status = 'Verifying Identity...');
+
+    final liveEmbedding = await widget.engine.getEmbedding(faceCrop);
+    if (liveEmbedding == null) return;
+
+    final all = await widget.storage.readAll();
+    if (all.isEmpty) {
+      debugPrint('DATABASE EMPTY: No registered profiles found.');
+      if (mounted) setState(() => _status = 'DATABASE EMPTY');
+      return;
     }
 
-    if (_blinkDetected && _headTurnDetected) {
-      if (mounted) setState(() => _status = 'Verifying Identity...');
+    double highestSimilarity = -1.0;
+    String? bestMatchId;
 
-      final all = await widget.storage.readAll();
-      if (all.isEmpty) {
-        _finishFlow('No registered users found', success: false);
-        return;
+    debugPrint('--- IDENTITY SEARCH: COMPARING AGAINST ${all.length} USERS ---');
+    for (var entry in all.entries) {
+      try {
+        final template = List<double>.from(jsonDecode(entry.value));
+        final similarity = OnnxEngine.computeCosineSimilarity(liveEmbedding, template);
+        debugPrint(' [CHECK] User: ${entry.key} | Similarity: ${similarity.toStringAsFixed(4)}');
+
+        if (similarity > highestSimilarity) {
+          highestSimilarity = similarity;
+          bestMatchId = entry.key;
+        }
+      } catch (e) {
+        debugPrint(' [ERROR] Could not parse profile for: ${entry.key}');
       }
+    }
 
-      final liveEmbedding = await widget.engine.getEmbedding(faceCrop);
-      if (liveEmbedding == null) return;
-
-      bool matched = false;
-      String matchedId = '';
-
-      for (var entry in all.entries) {
-        try {
-          final template = List<double>.from(jsonDecode(entry.value));
-          final similarity = OnnxEngine.computeCosineSimilarity(liveEmbedding, template);
-          if (similarity > 0.75) {
-            matched = true;
-            matchedId = entry.key;
-            break;
-          }
-        } catch (e) { continue; }
-      }
-
-      if (matched) {
-        HapticFeedback.heavyImpact();
-        _finishFlow('Welcome, $matchedId');
-      } else {
-        if (mounted) setState(() => _status = 'Identity mismatch');
+    if (bestMatchId != null && highestSimilarity > 0.65) {
+      debugPrint(' >>> MATCH FOUND: $bestMatchId ($highestSimilarity)');
+      HapticFeedback.heavyImpact();
+      _finishFlow('Welcome, $bestMatchId');
+    } else {
+      debugPrint(' >>> NO MATCH (Best Score: $highestSimilarity)');
+      if (mounted) {
+        setState(() => _status = 'Mismatched (Best: ${highestSimilarity.toStringAsFixed(2)})');
       }
     }
   }
 
   void _finishFlow(String message, {bool success = true}) {
-    _controller?.stopImageStream();
-    _controller?.dispose();
-    _controller = null;
+    if (_controller != null) {
+      _controller?.stopImageStream();
+      _controller?.dispose();
+      if (mounted) {
+        setState(() {
+          _controller = null;
+        });
+      }
+    }
 
     Fluttertoast.showToast(
       msg: message,
@@ -399,7 +429,6 @@ class _CameraFlowScreenState extends State<CameraFlowScreen> {
         final int up = uPlane[uvIndex] - 128;
         final int vp = vPlane[uvIndex] - 128;
 
-        // More accurate integer-based conversion (approximate multipliers * 1024)
         int r = (yp + (vp * 1436 >> 10)).clamp(0, 255);
         int g = (yp - (up * 352 >> 10) - (vp * 731 >> 10)).clamp(0, 255);
         int b = (yp + (up * 1814 >> 10)).clamp(0, 255);
@@ -453,15 +482,6 @@ class _CameraFlowScreenState extends State<CameraFlowScreen> {
                             fontWeight: FontWeight.bold,
                             letterSpacing: 2,
                           ),
-                        ),
-                        const SizedBox(height: 8),
-                        Text(
-                          _instruction,
-                          style: const TextStyle(
-                            color: Colors.white,
-                            fontSize: 18,
-                          ),
-                          textAlign: TextAlign.center,
                         ),
                       ],
                     ),

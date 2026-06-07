@@ -23,23 +23,9 @@ class OnnxEngine {
     debugPrint('[ONNX] Initializing ONNX Runtime Environment...');
     OrtEnv.instance.init();
     final sessionOptions = OrtSessionOptions();
-    try {
-      debugPrint('[ONNX] Appending Default Providers...');
-      sessionOptions.appendDefaultProviders();
-    } catch (e) {
-      debugPrint('[ONNX] Hardware acceleration not available: $e');
-    }
-
-    debugPrint('[ONNX] Loading Face Detection Model (YuNet)...');
     _detectionSession = await _createSession('assets/models/face_detection_yunet_2023mar.onnx', sessionOptions);
-
-    debugPrint('[ONNX] Loading Face Recognition Model (EdgeFace)...');
     _recognitionSession = await _createSession('assets/models/edgeface_xs_gamma_06.onnx', sessionOptions);
-
-    debugPrint('[ONNX] Loading Liveness Model (MiniFASNet)...');
     _livenessSession = await _createSession('assets/models/best_model.onnx', sessionOptions);
-
-    debugPrint('[ONNX] All models loaded successfully.');
     _isInitialized = true;
   }
 
@@ -49,192 +35,119 @@ class OnnxEngine {
     return OrtSession.fromBuffer(bytes, options);
   }
 
-  /// Highly optimized preprocessing from CameraImage to BGR Planar Float32List
-  Float32List _preprocessYuNet(CameraImage image) {
+  Float32List _preprocessForYuNet(CameraImage image) {
     final Float32List bgrBuffer = Float32List(3 * _detHeight * _detWidth);
+    final int srcW = image.width;
+    final int srcH = image.height;
+    double scale = math.min(_detWidth / srcW, _detHeight / srcH);
+    int newW = (srcW * scale).toInt();
+    int newH = (srcH * scale).toInt();
+    int offsetX = (_detWidth - newW) ~/ 2;
+    int offsetY = (_detHeight - newH) ~/ 2;
 
-    final int uvRowStride = image.planes[1].bytesPerRow;
-    final int uvPixelStride = image.planes[1].bytesPerPixel ?? 1;
-
-    final int gOffset = _detHeight * _detWidth;
-    final int bOffset = 2 * _detHeight * _detWidth;
-
-    double scaleX = image.width / _detWidth;
-    double scaleY = image.height / _detHeight;
-
-    for (int y = 0; y < _detHeight; y++) {
-      int srcY = (y * scaleY).toInt();
+    for (int y = 0; y < newH; y++) {
+      int srcY = (y / scale).toInt().clamp(0, srcH - 1);
       int yRowOffset = srcY * image.planes[0].bytesPerRow;
-      int uvRowOffset = (srcY >> 1) * uvRowStride;
-      int destRowOffset = y * _detWidth;
+      int uvRowOffset = (srcY >> 1) * image.planes[1].bytesPerRow;
+      for (int x = 0; x < newW; x++) {
+        int srcX = (x / scale).toInt().clamp(0, srcW - 1);
+        int yp = image.planes[0].bytes[yRowOffset + srcX];
+        int uvIdx = uvRowOffset + (srcX >> 1) * (image.planes[1].bytesPerPixel ?? 1);
+        int up = image.planes[1].bytes[uvIdx];
+        int vp = image.planes[2].bytes[uvIdx];
 
-      for (int x = 0; x < _detWidth; x++) {
-        int srcX = (x * scaleX).toInt();
-        int yIndex = yRowOffset + srcX;
-        int uvIndex = uvRowOffset + (srcX >> 1) * uvPixelStride;
+        int r = (yp + 1.3707 * (vp - 128)).toInt().clamp(0, 255);
+        int g = (yp - 0.3376 * (up - 128) - 0.6980 * (vp - 128)).toInt().clamp(0, 255);
+        int b = (yp + 1.7324 * (up - 128)).toInt().clamp(0, 255);
 
-        int yp = image.planes[0].bytes[yIndex];
-        int up = image.planes[1].bytes[uvIndex];
-        int vp = image.planes[2].bytes[uvIndex];
-
-        // YUV to RGB Integer conversion
-        int r = (yp + 1.370705 * (vp - 128)).toInt().clamp(0, 255);
-        int g = (yp - 0.337633 * (up - 128) - 0.698001 * (vp - 128)).toInt().clamp(0, 255);
-        int b = (yp + 1.732446 * (up - 128)).toInt().clamp(0, 255);
-
-        int destIndex = destRowOffset + x;
-        // BGR Planar Layout for YuNet
-        bgrBuffer[destIndex] = b.toDouble();
-        bgrBuffer[gOffset + destIndex] = g.toDouble();
-        bgrBuffer[bOffset + destIndex] = r.toDouble();
+        int destIdx = (y + offsetY) * _detWidth + (x + offsetX);
+        bgrBuffer[destIdx] = b.toDouble();
+        bgrBuffer[_detWidth * _detHeight + destIdx] = g.toDouble();
+        bgrBuffer[2 * _detWidth * _detHeight + destIdx] = r.toDouble();
       }
     }
     return bgrBuffer;
   }
 
-  // Detect face using YuNet
   Future<Map<String, dynamic>?> detectFace(CameraImage image) async {
     if (_detectionSession == null) return null;
-
-    final inputData = _preprocessYuNet(image);
-    final inputShape = [1, 3, _detHeight, _detWidth];
-    final inputTensor = OrtValueTensor.createTensorWithDataList(inputData, inputShape);
-    final inputs = {'input': inputTensor};
-
+    final inputData = _preprocessForYuNet(image);
+    final inputTensor = OrtValueTensor.createTensorWithDataList(inputData, [1, 3, _detHeight, _detWidth]);
     try {
-      final runOptions = OrtRunOptions();
-      final outputs = await _detectionSession!.run(runOptions, inputs);
-
-      if (outputs.isEmpty) return null;
-
-      final outputValue = outputs[0]?.value as List;
-      if (outputValue.isEmpty) {
-        for (var o in outputs) { o?.release(); }
-        return null;
-      }
-
-      // Handle YuNet output parsing logic [1, N, 15]
-      List bestDetection;
-      try {
-        final firstLevel = outputValue[0] as List;
-        if (firstLevel.isEmpty) {
-           for (var o in outputs) { o?.release(); }
-           return null;
+      final outputs = await _detectionSession!.run(OrtRunOptions(), {'input': inputTensor});
+      final List<_Candidate> candidates = [];
+      final strides = [8, 16, 32];
+      for (int i = 0; i < 3; i++) {
+        final stride = strides[i];
+        final List cls = (outputs[0 + i]?.value as List)[0];
+        final List obj = (outputs[3 + i]?.value as List)[0];
+        final List bbox = (outputs[6 + i]?.value as List)[0];
+        final cols = _detWidth ~/ stride;
+        for (int r = 0; r < (_detHeight ~/ stride); r++) {
+          for (int c = 0; c < cols; c++) {
+            int idx = r * cols + c;
+            double score = (cls[idx][0] as num).toDouble() * (obj[idx][0] as num).toDouble();
+            if (score > 0.3) {
+               final box = bbox[idx] as List;
+               candidates.add(_Candidate(rect: math.Rectangle((c + box[0]) * stride, (r + box[1]) * stride, math.exp(box[2]) * stride, math.exp(box[3]) * stride), score: score));
+            }
+          }
         }
-        if (firstLevel[0] is List) {
-          bestDetection = firstLevel[0] as List;
-        } else {
-          bestDetection = firstLevel;
-        }
-      } catch (e) {
-        for (var o in outputs) { o?.release(); }
-        return null;
       }
-
-      if (bestDetection.length < 15) {
-        for (var o in outputs) { o?.release(); }
-        return null;
-      }
-
-      final conf = (bestDetection[14] is double)
-          ? bestDetection[14] as double
-          : (bestDetection[14] as num).toDouble();
-
-      debugPrint('YuNet Confidence: $conf');
-
-      if (conf < 0.25) {
-        for (var o in outputs) { o?.release(); }
-        return null;
-      }
-
-      final result = {
-        'bbox': [
-          bestDetection[0] * image.width / _detWidth,
-          bestDetection[1] * image.height / _detHeight,
-          bestDetection[2] * image.width / _detWidth,
-          bestDetection[3] * image.height / _detHeight,
-        ],
-        'conf': conf,
-      };
-
-      for (var o in outputs) { o?.release(); }
-      return result;
-    } finally {
-      inputTensor.release();
-    }
+      for (var o in outputs) o?.release();
+      if (candidates.isEmpty) return null;
+      candidates.sort((a, b) => b.score.compareTo(a.score));
+      final best = candidates.first;
+      double scale = math.min(_detWidth / image.width, _detHeight / image.height);
+      return {'bbox': [(best.rect.left - (_detWidth - image.width*scale)/2)/scale, (best.rect.top - (_detHeight - image.height*scale)/2)/scale, best.rect.width/scale, best.rect.height/scale], 'conf': best.score};
+    } finally { inputTensor.release(); }
   }
 
-  // Get Embedding using EdgeFace
   Future<List<double>?> getEmbedding(img.Image faceCrop) async {
     if (_recognitionSession == null) return null;
 
-    final inputSize = 112;
-    final resized = img.copyResize(faceCrop, width: inputSize, height: inputSize);
+    // AGGRESSIVE ENHANCEMENT
+    // 1. Boost Contrast and Brightness
+    img.Image enhanced = img.adjustColor(faceCrop, contrast: 1.5, brightness: 1.1);
+    // 2. Sharpening filter to reveal eye/nose details through blur
+    enhanced = img.convolution(enhanced, filter: [0, -1, 0, -1, 5, -1, 0, -1, 0]);
 
-    final inputData = _imageToFloat32List(resized, [1, 3, inputSize, inputSize], normalize: true);
-    final inputTensor = OrtValueTensor.createTensorWithDataList(inputData, [1, 3, inputSize, inputSize]);
-    final inputs = {'input': inputTensor};
-
+    final resized = img.copyResize(enhanced, width: 112, height: 112);
+    // EdgeFace uses RGB Planar, NOT BGR
+    final inputData = _imageToFloat32List(resized, [1, 3, 112, 112], normalize: true, isBgr: false);
+    final inputTensor = OrtValueTensor.createTensorWithDataList(inputData, [1, 3, 112, 112]);
     try {
-      final runOptions = OrtRunOptions();
-      final outputs = await _recognitionSession!.run(runOptions, inputs);
-
-      if (outputs.isEmpty) return null;
-      final embeddingList = (outputs[0]?.value as List)[0] as List;
-      final embedding = embeddingList.map((e) => e as double).toList();
-
-      for (var o in outputs) { o?.release(); }
+      final outputs = await _recognitionSession!.run(OrtRunOptions(), {'input': inputTensor});
+      final embedding = ((outputs[0]?.value as List)[0] as List).map((e) => (e as num).toDouble()).toList();
+      for (var o in outputs) o?.release();
       return embedding;
-    } finally {
-      inputTensor.release();
-    }
+    } finally { inputTensor.release(); }
   }
 
-  // Check Liveness using MiniFASNet
   Future<double> checkLiveness(img.Image faceCrop) async {
     if (_livenessSession == null) return 0.0;
-
-    final inputSize = 80;
-    final resized = img.copyResize(faceCrop, width: inputSize, height: inputSize, interpolation: img.Interpolation.nearest);
-
-    final inputData = _imageToFloat32List(resized, [1, 3, inputSize, inputSize]);
-    final inputTensor = OrtValueTensor.createTensorWithDataList(inputData, [1, 3, inputSize, inputSize]);
-    final inputs = {'input': inputTensor};
-
+    final resized = img.copyResize(faceCrop, width: 128, height: 128);
+    final inputData = _imageToFloat32List(resized, [1, 3, 128, 128], normalize: true);
+    final inputTensor = OrtValueTensor.createTensorWithDataList(inputData, [1, 3, 128, 128]);
     try {
-      final runOptions = OrtRunOptions();
-      final outputs = await _livenessSession!.run(runOptions, inputs);
-
-      if (outputs.isEmpty) return 0.0;
-      final scores = (outputs[0]?.value as List)[0] as List;
-      final livenessScore = scores[1] as double;
-
-      for (var o in outputs) { o?.release(); }
-      return livenessScore;
-    } finally {
-      inputTensor.release();
-    }
+      final outputs = await _livenessSession!.run(OrtRunOptions(), {'input': inputTensor});
+      final List scores = (outputs[0]?.value as List)[0];
+      for (var o in outputs) o?.release();
+      double maxLogit = scores[0] > scores[1] ? scores[0] : scores[1];
+      return math.exp(scores[1] - maxLogit) / (math.exp(scores[0] - maxLogit) + math.exp(scores[1] - maxLogit));
+    } finally { inputTensor.release(); }
   }
 
   Float32List _imageToFloat32List(img.Image image, List<int> shape, {bool normalize = false, bool isBgr = false}) {
     final floatList = Float32List(shape[1] * shape[2] * shape[3]);
     var index = 0;
-
-    // NCHW format
     for (var c = 0; c < 3; c++) {
       int channel = isBgr ? (2 - c) : c;
       for (var y = 0; y < image.height; y++) {
         for (var x = 0; x < image.width; x++) {
           final pixel = image.getPixel(x, y);
-          double val;
-          if (channel == 0) val = pixel.r.toDouble();
-          else if (channel == 1) val = pixel.g.toDouble();
-          else val = pixel.b.toDouble();
-
-          if (normalize) {
-            val = (val - 127.5) / 128.0;
-          }
-          floatList[index++] = val;
+          double val = (channel == 0 ? pixel.r : (channel == 1 ? pixel.g : pixel.b)).toDouble();
+          floatList[index++] = normalize ? (val - 127.5) / 128.0 : val;
         }
       }
     }
@@ -242,9 +155,7 @@ class OnnxEngine {
   }
 
   static double computeCosineSimilarity(List<double> v1, List<double> v2) {
-    double dotProduct = 0.0;
-    double normA = 0.0;
-    double normB = 0.0;
+    double dotProduct = 0.0, normA = 0.0, normB = 0.0;
     for (int i = 0; i < v1.length; i++) {
       dotProduct += v1[i] * v2[i];
       normA += v1[i] * v1[i];
@@ -259,4 +170,10 @@ class OnnxEngine {
     _livenessSession?.release();
     OrtEnv.instance.release();
   }
+}
+
+class _Candidate {
+  final math.Rectangle rect;
+  final double score;
+  _Candidate({required this.rect, required this.score});
 }

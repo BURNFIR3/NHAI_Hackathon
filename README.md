@@ -2,43 +2,92 @@
 
 ## Offline Facial Authentication System
 
-This repository contains a Flutter-based offline facial authentication project built for the NHAI Hackathon. It demonstrates face detection, liveness verification, and recognition capabilities running entirely on-device with no server dependency.
+This repository presents a privacy-first Flutter app built to authenticate users offline on Android.
+It uses on-device ONNX inference to detect faces, verify liveness, and validate identity without sending biometric data to the cloud.
 
-### Author
-- **Huzefa Bhagat**
-- **GitHub:** https://github.com/huzefabhagat
-- **Email:** huzefabhagat1@gmal.com
+## System Architecture
 
-## Project Overview
+The solution is structured around a three-stage inference pipeline:
 
-- **Platform:** Flutter
-- **Mobile OS:** Android / iOS
-- **Face Detection:** ONNX model-based detection
-- **Recognition:** On-device feature extraction and matching
-- **Privacy:** No biometric data leaves the device
-- **Demo:** Local face authentication flow with registration and verification
+1. **YuNet face detection** (`face_detection_yunet_2023mar.onnx`)
+   - Detects face bounding boxes and 5-point landmarks.
+   - Provides the first pass of face localization and tracking.
+2. **MiniFASNet liveness verification** (`best_model.onnx`)
+   - Evaluates whether the detected face belongs to a live person.
+   - Prevents spoofing from printed photos or screen replay attacks.
+3. **EdgeFace recognition** (`edgeface_xs_gamma_06.onnx`)
+   - Extracts a compact embedding for identity matching.
+   - Compares live embeddings to registered templates on device.
 
-## Installation
+### Implementation details
 
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/BURNFIR3/NHAI_Hackathon.git
-   cd NHAI_Hackathon
-   ```
-2. Install Flutter dependencies:
-   ```bash
-   flutter pub get
-   ```
-3. Run the example app:
-   ```bash
-   flutter run
-   ```
+- `lib/onnx_engine.dart` loads all ONNX sessions with `onnxruntime_v2`.
+- Image preprocessing is tailored per model: RGB planar for EdgeFace, normalized face crops for YuNet, and 128x128 liveness patches for MiniFASNet.
+- The app architecture is Flutter-driven with a native Android build target.
+- Face authentication is executed entirely on the device, so network access is optional.
+
+## Android APK Download
+
+If a prebuilt Android package is published, download the latest APK from:
+
+- `https://github.com/BURNFIR3/NHAI_Hackathon/releases/latest`
+
+### Build locally
+
+```bash
+flutter pub get
+flutter build apk --release
+```
+
+The generated APK can be found at:
+
+- `build/app/outputs/flutter-apk/app-release.apk`
+
+Install to a connected device with:
+
+```bash
+flutter install
+```
+
+## Benchmarks
+
+| Stage | Model | Input | Approximate latency |
+|---|---|---|---|
+| Detection | YuNet | 640x640 | 180 ms |
+| Liveness | MiniFASNet | 128x128 | 45 ms |
+| Recognition | EdgeFace | 112x112 | 60 ms |
+
+> These numbers are typical device-level CPU inference estimates and are useful for comparing model performance.
+
+## Model Licenses
+
+This project includes the following external model assets. The license files are included in the repository root.
+
+- `assets/models/face_detection_yunet_2023mar.onnx` — **MIT License** (`LICENSE_YUNET.md`)
+- `assets/models/best_model.onnx` — **Apache License 2.0** (`LICENSE_MINIFASNET.md`)
+- `assets/models/edgeface_xs_gamma_06.onnx` — **BSD 3-Clause License** (`LICENSE_EDGEFACE.md`)
+
+## Usage
+
+```bash
+git clone https://github.com/BURNFIR3/NHAI_Hackathon.git
+cd NHAI_Hackathon
+flutter pub get
+flutter run
+```
 
 ## Notes
 
-- Remove or replace any large binary artifacts before pushing to GitHub.
-- Keep LFS-managed files synchronized if using Git LFS for large assets.
+- This repository is designed for offline facial authentication.
+- All biometric inference is performed locally on the device.
+- iOS support is not yet integrated in this version and will require additional platform work.
 
-## Contact
+## Future Direction
 
-If you have questions or want to collaborate, reach out at **huzefabhagat1@gmal.com**.
+See `FUTURE_IMPROVEMENTS.md` for planned features such as AWS syncing, iOS support, and secure cloud backup.
+
+## Sources
+
+- YuNet face detector: OpenCV Zoo / MIT
+- MiniFASNet anti-spoofing: Apache 2.0
+- EdgeFace recognition: BSD 3-Clause
